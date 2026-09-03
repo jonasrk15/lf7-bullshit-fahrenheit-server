@@ -534,9 +534,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+    let port = config.bind_addr.port();
     info!("🚀 Server läuft auf http://{}", config.bind_addr);
-    info!("   Webseite: http://localhost:3000");
-    info!("   API:      http://localhost:3000/api/temperatures");
+    info!("   Webseite: http://localhost:{port}");
+    info!("   API:      http://localhost:{port}/api/temperatures");
     println!("Server läuft auf http://{}", config.bind_addr);
 
     axum::serve(listener, app).await?;
