@@ -122,14 +122,13 @@ impl TemperatureRepository for SqliteTemperatureRepository {
     }
 
     async fn stats(&self) -> Result<Stats, AppError> {
-        let (count, avg, min, max): (i64, Option<f64>, Option<f64>, Option<f64>) =
-            sqlx::query_as(
-                "SELECT COUNT(*), AVG(temperature), MIN(temperature), MAX(temperature) \
+        let (count, avg, min, max): (i64, Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+            "SELECT COUNT(*), AVG(temperature), MIN(temperature), MAX(temperature) \
                  FROM temperatures",
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(database_error)?;
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
         Ok(Stats {
             count: usize::try_from(count)
                 .map_err(|_| AppError::Internal("Ungültige Anzahl in der Datenbank".into()))?,
@@ -152,15 +151,15 @@ impl TemperatureRepository for SqliteTemperatureRepository {
         }
 
         let entries = match tokio::fs::read_to_string(path).await {
-            Ok(content) => serde_json::from_str::<Vec<TemperatureEntry>>(&content).map_err(|error| {
-                AppError::Internal(format!(
-                    "Alte Datendatei {} konnte nicht gelesen werden: {error}",
-                    path.display()
-                ))
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Vec::new()
+            Ok(content) => {
+                serde_json::from_str::<Vec<TemperatureEntry>>(&content).map_err(|error| {
+                    AppError::Internal(format!(
+                        "Alte Datendatei {} konnte nicht gelesen werden: {error}",
+                        path.display()
+                    ))
+                })?
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 return Err(AppError::Internal(format!(
                     "Alte Datendatei {} konnte nicht geöffnet werden: {error}",

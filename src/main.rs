@@ -99,8 +99,8 @@ impl Config {
             .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
             .parse()
             .map_err(|error| format!("Ungültige BIND_ADDR: {error}"))?;
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
+        let database_url =
+            std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
         if !database_url.starts_with("sqlite:") {
             return Err(
                 "Diese Version unterstützt nur SQLite-DATABASE_URLs; PostgreSQL kann über einen zusätzlichen Repository-Adapter ergänzt werden"
@@ -310,9 +310,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Config::from_env().map_err(std::io::Error::other)?;
-    let repository = Arc::new(
-        SqliteTemperatureRepository::connect(&config.database_url).await?,
-    );
+    let repository = Arc::new(SqliteTemperatureRepository::connect(&config.database_url).await?);
     repository
         .import_legacy_json(&config.legacy_data_file)
         .await?;
@@ -438,14 +436,23 @@ mod tests {
             location: Some("Labor".to_string()),
         };
 
-        tokio::fs::write(&legacy_file, serde_json::to_vec(&vec![entry.clone()]).unwrap())
-            .await
-            .unwrap();
+        tokio::fs::write(
+            &legacy_file,
+            serde_json::to_vec(&vec![entry.clone()]).unwrap(),
+        )
+        .await
+        .unwrap();
         let repository = SqliteTemperatureRepository::connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(repository.import_legacy_json(&legacy_file).await.unwrap(), 1);
-        assert_eq!(repository.import_legacy_json(&legacy_file).await.unwrap(), 0);
+        assert_eq!(
+            repository.import_legacy_json(&legacy_file).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            repository.import_legacy_json(&legacy_file).await.unwrap(),
+            0
+        );
         let loaded = repository.list(&ListParams::default()).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, entry.id);
