@@ -5,6 +5,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY static ./static
+COPY migrations ./migrations
 
 RUN cargo build --locked --release \
     && strip target/release/temperatur-server
@@ -21,7 +22,8 @@ COPY --from=builder /build/target/release/temperatur-server /usr/local/bin/tempe
 COPY --chmod=755 deploy/container-healthcheck.sh /usr/local/bin/container-healthcheck
 
 ENV BIND_ADDR="0.0.0.0:3000" \
-    DATA_FILE="/var/lib/temperatur-server/data.json" \
+    DATABASE_URL="sqlite:///var/lib/temperatur-server/temperatures.db" \
+    LEGACY_DATA_FILE="/var/lib/temperatur-server/data.json" \
     RUST_LOG="temperatur_server=info,tower_http=info"
 
 USER 10001:10001

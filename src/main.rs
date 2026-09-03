@@ -12,17 +12,19 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     net::SocketAddr,
-    path::{Path as FilePath, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
+mod storage;
+use storage::{SqliteTemperatureRepository, TemperatureRepository};
+
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:3000";
-const DEFAULT_DATA_FILE: &str = "data.json";
+const DEFAULT_DATABASE_URL: &str = "sqlite://temperatures.db";
+const DEFAULT_LEGACY_DATA_FILE: &str = "data.json";
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 1_000;
 const MAX_METADATA_LENGTH: usize = 200;
@@ -30,8 +32,8 @@ const MAX_REQUEST_BODY_SIZE: usize = 16 * 1024;
 
 // --- Datenmodelle ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TemperatureEntry {
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub(crate) struct TemperatureEntry {
     id: String,
     temperature: f64,
     timestamp: DateTime<Utc>,
@@ -49,8 +51,8 @@ struct CreateTemperature {
     timestamp: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListParams {
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ListParams {
     limit: Option<usize>,
     offset: Option<usize>,
     sensor_id: Option<String>,
@@ -60,7 +62,7 @@ struct ListParams {
 }
 
 #[derive(Debug, Serialize)]
-struct Stats {
+pub(crate) struct Stats {
     count: usize,
     avg: Option<f64>,
     min: Option<f64>,
@@ -78,16 +80,15 @@ struct Health {
 // --- Shared State ---
 
 struct AppState {
-    entries: RwLock<Vec<TemperatureEntry>>,
-    persistence: Mutex<()>,
-    data_file: PathBuf,
+    repository: Arc<dyn TemperatureRepository>,
 }
 
 type SharedState = Arc<AppState>;
 
 struct Config {
     bind_addr: SocketAddr,
-    data_file: PathBuf,
+    database_url: String,
+    legacy_data_file: PathBuf,
     seed_demo: bool,
     cors_origin: Option<HeaderValue>,
 }
@@ -98,10 +99,17 @@ impl Config {
             .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
             .parse()
             .map_err(|error| format!("Ungültige BIND_ADDR: {error}"))?;
-        let data_file = std::env::var_os("DATA_FILE")
+        let database_url =
+            std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
+        if !database_url.starts_with("sqlite:") {
+            return Err(
+                "Diese Version unterstützt nur SQLite-DATABASE_URLs; PostgreSQL kann über einen zusätzlichen Repository-Adapter ergänzt werden"
+                    .to_string(),
+            );
+        }
+        let legacy_data_file = std::env::var_os("LEGACY_DATA_FILE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_FILE));
-        let data_file = validate_data_file(data_file)?;
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_LEGACY_DATA_FILE));
         let seed_demo = std::env::var("SEED_DEMO")
             .map(|value| {
                 value
@@ -121,170 +129,33 @@ impl Config {
 
         Ok(Self {
             bind_addr,
-            data_file,
+            database_url,
+            legacy_data_file,
             seed_demo,
             cors_origin,
         })
     }
 }
 
-// --- Persistence ---
-
-fn validate_data_file(data_file: PathBuf) -> Result<PathBuf, String> {
-    let has_trailing_separator = data_file
-        .as_os_str()
-        .as_encoded_bytes()
-        .last()
-        .is_some_and(|byte| *byte == b'/' || (cfg!(windows) && *byte == b'\\'));
-
-    if data_file.as_os_str().is_empty()
-        || data_file.file_name().is_none()
-        || has_trailing_separator
-        || data_file.is_dir()
-    {
-        return Err(
-            "DATA_FILE muss auf eine Datei und nicht auf ein Verzeichnis zeigen".to_string(),
-        );
-    }
-
-    Ok(data_file)
-}
-
-async fn load_data(state: &SharedState) -> Result<(), AppError> {
-    match tokio::fs::read_to_string(&state.data_file).await {
-        Ok(content) => match serde_json::from_str::<Vec<TemperatureEntry>>(&content) {
-            Ok(data) => {
-                let count = data.len();
-                *state.entries.write().await = data;
-                info!(
-                    "{} Einträge aus {} geladen",
-                    count,
-                    state.data_file.display()
-                );
-                Ok(())
-            }
-            Err(error) => Err(AppError::Internal(format!(
-                "Fehler beim Parsen von {}: {error}",
-                state.data_file.display()
-            ))),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            info!(
-                "Keine bestehende {} gefunden, starte leer",
-                state.data_file.display()
-            );
-            Ok(())
-        }
-        Err(error) => Err(AppError::Internal(format!(
-            "Fehler beim Laden von {}: {error}",
-            state.data_file.display()
-        ))),
-    }
-}
-
-fn temp_file_path(data_file: &FilePath) -> PathBuf {
-    let file_name = data_file.file_name().unwrap_or_default().to_string_lossy();
-    data_file.with_file_name(format!("{file_name}.tmp"))
-}
-
-async fn save_data(data_file: &FilePath, data: &[TemperatureEntry]) -> Result<(), AppError> {
-    let json = serde_json::to_string_pretty(data)
-        .map_err(|e| AppError::Internal(format!("Fehler beim Serialisieren: {e}")))?;
-    if let Some(parent) = data_file
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            AppError::Internal(format!(
-                "Datenverzeichnis {} konnte nicht erstellt werden: {error}",
-                parent.display()
-            ))
-        })?;
-    }
-
-    let temp_file = temp_file_path(data_file);
-    let mut file = tokio::fs::File::create(&temp_file).await.map_err(|error| {
-        AppError::Internal(format!(
-            "Fehler beim Öffnen von {}: {error}",
-            temp_file.display()
-        ))
-    })?;
-    file.write_all(json.as_bytes()).await.map_err(|error| {
-        AppError::Internal(format!(
-            "Fehler beim Speichern nach {}: {error}",
-            temp_file.display()
-        ))
-    })?;
-    file.sync_all().await.map_err(|error| {
-        AppError::Internal(format!(
-            "Fehler beim Synchronisieren von {}: {error}",
-            temp_file.display()
-        ))
-    })?;
-    drop(file);
-    tokio::fs::rename(&temp_file, data_file)
-        .await
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "Fehler beim Ersetzen von {}: {error}",
-                data_file.display()
-            ))
-        })
-}
-
 // --- API Handler ---
 
-async fn health_handler(State(state): State<SharedState>) -> Json<Health> {
-    let count = state.entries.read().await.len();
-    Json(Health {
+async fn health_handler(State(state): State<SharedState>) -> Result<Json<Health>, AppError> {
+    let count = state.repository.count().await?;
+    Ok(Json(Health {
         status: "ok".to_string(),
         count,
         version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+    }))
 }
 
 async fn list_temperatures(
     State(state): State<SharedState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<TemperatureEntry>>, AppError> {
-    let (offset, limit) = validate_list_params(&params)?;
-    let data = state.entries.read().await;
-    let mut filtered: Vec<TemperatureEntry> = data
-        .iter()
-        .filter(|e| {
-            if let Some(ref sid) = params.sensor_id {
-                if e.sensor_id.as_deref() != Some(sid) {
-                    return false;
-                }
-            }
-            if let Some(ref loc) = params.location {
-                if e.location.as_deref() != Some(loc) {
-                    return false;
-                }
-            }
-            if let Some(ref from) = params.from {
-                if e.timestamp < *from {
-                    return false;
-                }
-            }
-            if let Some(ref to) = params.to {
-                if e.timestamp > *to {
-                    return false;
-                }
-            }
-            true
-        })
-        .cloned()
-        .collect();
-
-    // Neueste zuerst sortieren (timestamp absteigend)
-    filtered.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
-
-    let result: Vec<TemperatureEntry> = filtered.into_iter().skip(offset).take(limit).collect();
-    Ok(Json(result))
+    Ok(Json(state.repository.list(&params).await?))
 }
 
-fn validate_list_params(params: &ListParams) -> Result<(usize, usize), AppError> {
+pub(crate) fn validate_list_params(params: &ListParams) -> Result<(usize, usize), AppError> {
     let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
     if limit > MAX_PAGE_LIMIT {
         return Err(AppError::BadRequest(format!(
@@ -316,9 +187,7 @@ fn normalize_metadata(value: Option<String>, field: &str) -> Result<Option<Strin
 }
 
 async fn get_latest(State(state): State<SharedState>) -> Result<Json<TemperatureEntry>, AppError> {
-    let data = state.entries.read().await;
-    let latest = data.iter().max_by_key(|e| e.timestamp).cloned();
-    match latest {
+    match state.repository.latest().await? {
         Some(entry) => Ok(Json(entry)),
         None => Err(AppError::NotFound("Keine Daten vorhanden".into())),
     }
@@ -328,10 +197,10 @@ async fn get_by_id(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<TemperatureEntry>, AppError> {
-    let data = state.entries.read().await;
-    data.iter()
-        .find(|e| e.id == id)
-        .cloned()
+    state
+        .repository
+        .get(&id)
+        .await?
         .map(Json)
         .ok_or_else(|| AppError::NotFound(format!("ID {id} nicht gefunden")))
 }
@@ -360,20 +229,7 @@ async fn create_temperature(
         location: normalize_metadata(payload.location, "location")?,
     };
 
-    let _persistence = state.persistence.lock().await;
-    let mut data = state.entries.write().await;
-    data.push(entry.clone());
-    let snapshot = data.clone();
-    drop(data);
-
-    if let Err(error) = save_data(&state.data_file, &snapshot).await {
-        state
-            .entries
-            .write()
-            .await
-            .retain(|item| item.id != entry.id);
-        return Err(error);
-    }
+    state.repository.create(&entry).await?;
 
     Ok((StatusCode::CREATED, Json(entry)))
 }
@@ -382,71 +238,19 @@ async fn delete_by_id(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let _persistence = state.persistence.lock().await;
-    let mut data = state.entries.write().await;
-    let index = data
-        .iter()
-        .position(|entry| entry.id == id)
-        .ok_or_else(|| AppError::NotFound(format!("ID {id} nicht gefunden")))?;
-    let removed = data.remove(index);
-    let snapshot = data.clone();
-    drop(data);
-
-    if let Err(error) = save_data(&state.data_file, &snapshot).await {
-        state.entries.write().await.insert(index, removed);
-        return Err(error);
+    if !state.repository.delete(&id).await? {
+        return Err(AppError::NotFound(format!("ID {id} nicht gefunden")));
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_all(State(state): State<SharedState>) -> Result<StatusCode, AppError> {
-    let _persistence = state.persistence.lock().await;
-    let mut data = state.entries.write().await;
-    if data.is_empty() {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    let previous = std::mem::take(&mut *data);
-    drop(data);
-
-    if let Err(error) = save_data(&state.data_file, &[]).await {
-        *state.entries.write().await = previous;
-        return Err(error);
-    }
+    state.repository.delete_all().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_stats(State(state): State<SharedState>) -> Json<Stats> {
-    let data = state.entries.read().await;
-    if data.is_empty() {
-        return Json(Stats {
-            count: 0,
-            avg: None,
-            min: None,
-            max: None,
-            latest: None,
-        });
-    }
-    let count = data.len();
-    let sum: f64 = data.iter().map(|e| e.temperature).sum();
-    let avg = sum / count as f64;
-    let min = data
-        .iter()
-        .map(|e| e.temperature)
-        .fold(f64::INFINITY, f64::min);
-    let max = data
-        .iter()
-        .map(|e| e.temperature)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let latest = data.iter().max_by_key(|e| e.timestamp).cloned();
-
-    Json(Stats {
-        count,
-        avg: Some(avg),
-        min: Some(min),
-        max: Some(max),
-        latest,
-    })
+async fn get_stats(State(state): State<SharedState>) -> Result<Json<Stats>, AppError> {
+    Ok(Json(state.repository.stats().await?))
 }
 
 // --- Error Handling ---
@@ -506,25 +310,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Config::from_env().map_err(std::io::Error::other)?;
+    let repository = Arc::new(SqliteTemperatureRepository::connect(&config.database_url).await?);
+    repository
+        .import_legacy_json(&config.legacy_data_file)
+        .await?;
     let state: SharedState = Arc::new(AppState {
-        entries: RwLock::new(Vec::new()),
-        persistence: Mutex::new(()),
-        data_file: config.data_file.clone(),
+        repository: repository.clone(),
     });
-    load_data(&state).await?;
 
-    if config.seed_demo && state.entries.read().await.is_empty() {
-        let mut data = state.entries.write().await;
-        data.push(TemperatureEntry {
-            id: Uuid::new_v4().to_string(),
-            temperature: 21.5,
-            timestamp: Utc::now(),
-            sensor_id: Some("demo-sensor-1".into()),
-            location: Some("Wohnzimmer".into()),
-        });
-        let snapshot = data.clone();
-        drop(data);
-        save_data(&state.data_file, &snapshot).await?;
+    if config.seed_demo && repository.count().await? == 0 {
+        repository
+            .create(&TemperatureEntry {
+                id: Uuid::new_v4().to_string(),
+                temperature: 21.5,
+                timestamp: Utc::now(),
+                sensor_id: Some("demo-sensor-1".into()),
+                location: Some("Wohnzimmer".into()),
+            })
+            .await?;
     }
 
     let mut app = Router::new()
@@ -570,23 +373,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn data_file_must_refer_to_a_file() {
-        let root = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
-        let trailing_separator =
-            PathBuf::from(format!("temperatures{}", std::path::MAIN_SEPARATOR));
-
-        assert!(validate_data_file(PathBuf::new()).is_err());
-        assert!(validate_data_file(root).is_err());
-        assert!(validate_data_file(trailing_separator).is_err());
-        assert!(validate_data_file(std::env::temp_dir()).is_err());
-
-        assert_eq!(
-            validate_data_file(PathBuf::from("data.json")).unwrap(),
-            PathBuf::from("data.json")
-        );
-    }
 
     #[test]
     fn metadata_is_trimmed_and_empty_values_are_omitted() {
@@ -637,9 +423,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistence_round_trip_uses_configured_path() {
-        let directory = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        let data_file = directory.join("nested/temperatures.json");
+    async fn sqlite_round_trip_and_legacy_import_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_file = directory.path().join("temperatures.db");
+        let database_url = format!("sqlite://{}", database_file.display());
+        let legacy_file = directory.path().join("data.json");
         let entry = TemperatureEntry {
             id: Uuid::new_v4().to_string(),
             temperature: 21.5,
@@ -648,20 +436,52 @@ mod tests {
             location: Some("Labor".to_string()),
         };
 
-        save_data(&data_file, std::slice::from_ref(&entry))
+        tokio::fs::write(
+            &legacy_file,
+            serde_json::to_vec(&vec![entry.clone()]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let repository = SqliteTemperatureRepository::connect(&database_url)
             .await
             .unwrap();
-        let state = Arc::new(AppState {
-            entries: RwLock::new(Vec::new()),
-            persistence: Mutex::new(()),
-            data_file,
-        });
-        load_data(&state).await.unwrap();
-
-        let loaded = state.entries.read().await;
+        assert_eq!(
+            repository.import_legacy_json(&legacy_file).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            repository.import_legacy_json(&legacy_file).await.unwrap(),
+            0
+        );
+        let loaded = repository.list(&ListParams::default()).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, entry.id);
-        drop(loaded);
-        std::fs::remove_dir_all(directory).unwrap();
+
+        let second = TemperatureEntry {
+            id: Uuid::new_v4().to_string(),
+            temperature: 23.5,
+            timestamp: entry.timestamp + chrono::Duration::minutes(1),
+            sensor_id: Some("sensor-2".to_string()),
+            location: Some("Büro".to_string()),
+        };
+        repository.create(&second).await.unwrap();
+        let filtered = repository
+            .list(&ListParams {
+                sensor_id: Some("sensor-2".to_string()),
+                ..ListParams::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, second.id);
+
+        let stats = repository.stats().await.unwrap();
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.avg, Some(22.5));
+        assert_eq!(stats.latest.unwrap().id, second.id);
+        assert!(repository.delete(&entry.id).await.unwrap());
+        assert!(!repository.delete("missing").await.unwrap());
+        repository.delete_all().await.unwrap();
+        assert_eq!(repository.count().await.unwrap(), 0);
     }
 }

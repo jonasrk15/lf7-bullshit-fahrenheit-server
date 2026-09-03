@@ -6,7 +6,9 @@ Webserver mit Webseite und REST-API zum Speichern von Temperaturdaten. Backend i
 
 - **Webseite** auf `http://localhost:3000` – Dashboard mit Live-Chart, Statistiken, Formular, Tabelle
 - **REST-API** zum Ablegen/Abfragen von Temperaturen
-- **Atomare Persistenz** in `data.json` (Pfad konfigurierbar)
+- **Eingebaute SQLite-Datenbank** mit automatischen Migrationen
+- **Automatische Übernahme** einer vorhandenen `data.json` beim ersten Start
+- **Austauschbare Storage-Schicht** als Grundlage für einen späteren PostgreSQL-Adapter
 - **Validierung** (`-100..100 °C`, begrenzte Metadaten und Request-Größe)
 - **Filter** nach `sensor_id`, `location`, Zeitraum, begrenzte Paginierung
 - **Sichere Voreinstellung** ohne Cross-Origin-Zugriff oder Demo-Daten
@@ -21,7 +23,7 @@ RUST_LOG=debug cargo run
 # optional auf einer anderen Adresse:
 BIND_ADDR=127.0.0.1:3001 cargo run
 # optional mit anderem Speicherort:
-DATA_FILE=/var/lib/temperatur-server/data.json cargo run
+DATABASE_URL=sqlite:///var/lib/temperatur-server/temperatures.db cargo run
 ```
 
 Server läuft auf `http://0.0.0.0:3000` → Webseite unter `http://localhost:3000`
@@ -42,8 +44,9 @@ podman run --rm \
   ghcr.io/jonasrk15/lf7-bullshit-fahrenheit-server:latest
 ```
 
-Das Image läuft ohne Root-Rechte als UID/GID `10001`, speichert seine Daten unter
-`/var/lib/temperatur-server/data.json` und prüft `/api/health` automatisch. Für
+Das Image läuft ohne Root-Rechte als UID/GID `10001`, speichert seine SQLite-Datenbank
+unter `/var/lib/temperatur-server/temperatures.db` und prüft `/api/health`
+automatisch. Für
 reproduzierbare Deployments sollte statt `latest` ein Release-Tag wie `0.1.0`
 verwendet werden.
 
@@ -79,12 +82,26 @@ es ohne `podman login ghcr.io` abrufen sollen.
 | Variable | Standard | Beschreibung |
 |----------|----------|--------------|
 | `BIND_ADDR` | `0.0.0.0:3000` | Socket-Adresse des Servers |
-| `DATA_FILE` | `data.json` | Pfad zur JSON-Datei; fehlende Verzeichnisse werden angelegt |
+| `DATABASE_URL` | `sqlite://temperatures.db` | SQLite-Verbindungs-URL; die Datenbankdatei wird bei Bedarf angelegt |
+| `LEGACY_DATA_FILE` | `data.json` | Alte JSON-Datei, die beim ersten Start einmalig importiert wird |
 | `SEED_DEMO` | `false` | Erzeugt beim ersten Start mit leerem Datenspeicher einen Demo-Wert |
 | `CORS_ORIGIN` | nicht gesetzt | Erlaubt genau diesen zusätzlichen Browser-Origin, z. B. `https://dashboard.example` |
 | `RUST_LOG` | `temperatur_server=debug,tower_http=debug` | Log-Filter |
 
-Eine vorhandene, aber ungültige Datendatei beendet den Start mit einer Fehlermeldung. Dadurch wird eine beschädigte Datei nicht unbemerkt mit neuen Daten überschrieben.
+Beim Start werden aus `migrations/` automatisch noch nicht angewendete
+SQL-Migrationen ausgeführt. Ist die SQLite-Datenbank leer und existiert die alte
+`data.json`, werden deren Messwerte einmalig in einer Transaktion übernommen. Die
+JSON-Datei bleibt dabei als Sicherung unverändert. Ein Marker in der Datenbank
+verhindert einen erneuten Import nach einem späteren Löschen der Messwerte.
+
+### Später PostgreSQL verwenden
+
+Die HTTP-Handler greifen nur auf das Trait `TemperatureRepository` zu. SQLite ist
+in `src/storage/sqlite.rs` implementiert. Für PostgreSQL kann daher ein zweiter
+Adapter (zum Beispiel `src/storage/postgres.rs`) ergänzt und anhand des Schemas von
+`DATABASE_URL` ausgewählt werden, ohne REST-Routen, Validierung oder Frontend neu
+zu schreiben. Da SQLite und PostgreSQL unterschiedliche SQL-Dialekte und
+Migrationstabellen verwenden, benötigt der PostgreSQL-Adapter eigene Migrationen.
 
 ## API
 
@@ -144,15 +161,17 @@ curl -X POST http://localhost:3000/api/temperatures/<id>/delete
 ```
 .
 ├── Cargo.toml
-├── src/main.rs        # Axum Server + API + State + Persistence
+├── migrations/        # automatisch ausgeführte SQLite-Migrationen
+├── src/main.rs        # Axum Server, API und Validierung
+├── src/storage/       # austauschbare Datenhaltung + SQLite-Adapter
 ├── static/index.html  # Frontend (wird via include_str! eingebettet)
-├── data.json          # Persistenz (wird auto-erzeugt)
+├── temperatures.db    # SQLite-Persistenz (wird auto-erzeugt)
 └── target/            # Build-Artefakte
 ```
 
 ## Erweitern
 
-- Datenbank statt `data.json`: `sqlx` mit SQLite/Postgres
+- PostgreSQL-Adapter für die vorhandene `TemperatureRepository`-Schnittstelle
 - Auth: `tower-http` + JWT
 - HTTPS: hinter Reverse-Proxy (nginx/caddy) oder `axum-server` mit TLS
 
