@@ -8,6 +8,7 @@ on:
       - Cargo.lock
       - Cargo.toml
       - src/**
+      - migrations/**
       - static/**
       - deploy/container-healthcheck.sh
       - .github/workflows/container.yml

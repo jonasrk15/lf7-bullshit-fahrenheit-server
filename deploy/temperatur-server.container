@@ -10,7 +10,8 @@ Pull=newer
 PublishPort=3000:3000
 Volume=/opt/temperatur-server/data:/var/lib/temperatur-server:Z,U
 Environment=BIND_ADDR=0.0.0.0:3000
-Environment=DATA_FILE=/var/lib/temperatur-server/data.json
+Environment=DATABASE_URL=sqlite:///var/lib/temperatur-server/temperatures.db
+Environment=LEGACY_DATA_FILE=/var/lib/temperatur-server/data.json
 Environment=RUST_LOG=temperatur_server=info,tower_http=info
 DropCapability=all
 NoNewPrivileges=true
