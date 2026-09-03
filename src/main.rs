@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use chrono::{DateTime, Utc};
@@ -365,6 +365,8 @@ async fn main() {
         .route("/api/temperatures", get(list_temperatures).post(create_temperature).delete(delete_all))
         .route("/api/temperatures/latest", get(get_latest))
         .route("/api/temperatures/:id", get(get_by_id).delete(delete_by_id))
+        .route("/api/temperatures/clear", post(delete_all))
+        .route("/api/temperatures/:id/delete", post(delete_by_id))
         .route("/api/stats", get(get_stats))
         .with_state(state)
         .layer(CorsLayer::permissive())

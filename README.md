@@ -32,8 +32,8 @@ Server läuft auf `http://0.0.0.0:3000` → Webseite unter `http://localhost:300
 | `GET` | `/api/temperatures/latest` | Neueste Messung |
 | `GET` | `/api/temperatures/:id` | Einzelne Messung |
 | `POST` | `/api/temperatures` | Neue Messung |
-| `DELETE` | `/api/temperatures/:id` | Löschen |
-| `DELETE` | `/api/temperatures` | Alle löschen |
+| `POST` | `/api/temperatures/:id/delete` | Löschen |
+| `POST` | `/api/temperatures/clear` | Alle löschen |
 | `GET` | `/api/stats` | `count`, `avg`, `min`, `max`, `latest` |
 
 ### POST Body
@@ -68,7 +68,7 @@ curl http://localhost:3000/api/temperatures/latest | jq
 curl http://localhost:3000/api/stats | jq
 
 # Löschen
-curl -X DELETE http://localhost:3000/api/temperatures/<id>
+curl -X POST http://localhost:3000/api/temperatures/<id>/delete
 ```
 
 ## Projektstruktur

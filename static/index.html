@@ -268,8 +268,8 @@ GET    /api/temperatures/latest    - Neueste Messung
 GET    /api/temperatures/:id       - Einzelne Messung
 POST   /api/temperatures           - Neue Messung anlegen
   Body: { "temperature": 21.5, "sensor_id": "sensor-1", "location": "Wohnzimmer", "timestamp": "2024-01-01T12:00:00Z" } (letzte 3 Felder optional)
-DELETE /api/temperatures/:id       - Messung löschen
-DELETE /api/temperatures           - Alle Messungen löschen
+POST   /api/temperatures/:id/delete - Messung löschen
+POST   /api/temperatures/clear      - Alle Messungen löschen
 GET    /api/stats                  - Statistiken (count, avg, min, max)
 
 Beispiel mit curl:
@@ -446,7 +446,7 @@ function renderChart(data) {
 async function del(id) {
   if (!confirm("Messung löschen?")) return;
   try {
-    await fetchJSON(`${api}/${id}`, { method: "DELETE" });
+    await fetchJSON(`${api}/${id}/delete`, { method: "POST" });
     toast("Gelöscht");
     loadData();
   } catch(e) { toast(e.message, "error"); }
@@ -456,7 +456,7 @@ async function clearAll() {
   if (document.getElementById("clearAllButton").disabled) return;
   if (!confirm("Wirklich ALLE Messungen löschen?")) return;
   try {
-    await fetchJSON(api, { method: "DELETE" });
+    await fetchJSON(`${api}/clear`, { method: "POST" });
     toast("Alle gelöscht");
     loadData();
   } catch(e) { toast(e.message, "error"); }
