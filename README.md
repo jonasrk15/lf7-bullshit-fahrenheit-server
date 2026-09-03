@@ -26,6 +26,54 @@ DATA_FILE=/var/lib/temperatur-server/data.json cargo run
 
 Server läuft auf `http://0.0.0.0:3000` → Webseite unter `http://localhost:3000`
 
+
+## Container und Podman
+
+Das Image wird bei jedem veröffentlichten GitHub-Release für `linux/amd64` und
+`linux/arm64` gebaut und in der GitHub Container Registry veröffentlicht. Dadurch
+wird auf dem Zielsystem keine Rust-Toolchain benötigt.
+
+```bash
+podman pull ghcr.io/jonasrk15/lf7-bullshit-fahrenheit-server:latest
+podman run --rm \
+  --name temperatur-server \
+  -p 3000:3000 \
+  -v temperatur-server-data:/var/lib/temperatur-server \
+  ghcr.io/jonasrk15/lf7-bullshit-fahrenheit-server:latest
+```
+
+Das Image läuft ohne Root-Rechte als UID/GID `10001`, speichert seine Daten unter
+`/var/lib/temperatur-server/data.json` und prüft `/api/health` automatisch. Für
+reproduzierbare Deployments sollte statt `latest` ein Release-Tag wie `0.1.0`
+verwendet werden.
+
+### Podman Quadlet
+
+Eine vorbereitete Quadlet-Datei liegt unter
+[`deploy/temperatur-server.container`](deploy/temperatur-server.container). Für
+ein rootful Deployment:
+
+```bash
+mkdir -p /opt/temperatur-server/data
+cp deploy/temperatur-server.container /etc/containers/systemd/
+systemctl daemon-reload
+systemctl start temperatur-server
+```
+
+Der Mount nutzt `:Z,U`: `Z` setzt die private SELinux-Kennzeichnung und `U` passt
+den Besitzer des Datenverzeichnisses an die UID des Containers an.
+
+### Neues Image veröffentlichen
+
+1. Einen Git-Tag erstellen, beispielsweise `v0.1.0`.
+2. Aus diesem Tag auf GitHub ein Release veröffentlichen.
+3. Der Workflow **Container image** veröffentlicht anschließend unter anderem
+   die Tags `v0.1.0`, `0.1.0`, `0.1`, `0` und `latest` in GHCR.
+
+Beim ersten veröffentlichten Image muss die Sichtbarkeit des GHCR-Pakets einmalig
+in dessen GitHub-Paketeinstellungen auf **Public** gestellt werden, wenn Zielsysteme
+es ohne `podman login ghcr.io` abrufen sollen.
+
 ### Konfiguration
 
 | Variable | Standard | Beschreibung |

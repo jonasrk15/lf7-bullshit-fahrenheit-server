@@ -1,0 +1,7 @@
+.git
+.github
+target
+data.json
+*.tmp
+README.md
+deploy/temperatur-server.container
