@@ -112,6 +112,7 @@
   }
   button:hover { opacity: 0.9; transform: translateY(-1px); }
   button:active { transform: translateY(0); }
+  button:disabled { cursor: not-allowed; opacity: 0.45; transform: none; }
   button.secondary {
     background: transparent;
     border: 1px solid var(--border);
@@ -243,7 +244,7 @@
     <div class="card" style="margin-top:20px">
       <div style="display:flex; justify-content:space-between; align-items:center">
         <h2 style="margin:0">📋 Letzte Messungen</h2>
-        <button class="danger" onclick="clearAll()">Alle löschen</button>
+        <button class="danger" id="clearAllButton" onclick="clearAll()" disabled>Alle löschen</button>
       </div>
       <div style="max-height:360px; overflow:auto">
         <table>
@@ -283,9 +284,21 @@ curl http://localhost:3000/api/temperatures | jq
 <script>
 const api = "/api/temperatures";
 let chart;
+let loading = false;
+let refreshPending = false;
 
 async function fetchJSON(url, opts) {
-  const r = await fetch(url, opts);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  let r;
+  try {
+    r = await fetch(url, { ...opts, signal: controller.signal });
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("Zeitüberschreitung bei der Serveranfrage");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!r.ok) {
     const e = await r.json().catch(()=>({error:r.statusText}));
     throw new Error(e.error || r.statusText);
@@ -338,21 +351,32 @@ async function loadStats() {
 }
 
 async function loadData() {
+  if (loading) {
+    refreshPending = true;
+    return;
+  }
+  loading = true;
   const limit = document.getElementById("limitSelect").value;
   try {
     const data = await fetchJSON(`${api}?limit=${limit}`);
     renderTable(data);
     renderChart(data);
-    loadStats();
-    loadHealth();
+    await Promise.all([loadStats(), loadHealth()]);
   } catch(e) {
     toast(e.message, "error");
+  } finally {
+    loading = false;
+    if (refreshPending) {
+      refreshPending = false;
+      loadData();
+    }
   }
 }
 
 function renderTable(data) {
   const tbody = document.getElementById("tbody");
   const empty = document.getElementById("empty");
+  document.getElementById("clearAllButton").disabled = data.length === 0;
   tbody.innerHTML = "";
   if (!data.length) {
     empty.style.display = "block";
@@ -429,6 +453,7 @@ async function del(id) {
 }
 
 async function clearAll() {
+  if (document.getElementById("clearAllButton").disabled) return;
   if (!confirm("Wirklich ALLE Messungen löschen?")) return;
   try {
     await fetchJSON(api, { method: "DELETE" });
