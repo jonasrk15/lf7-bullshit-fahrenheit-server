@@ -160,20 +160,17 @@ async fn load_data(state: &SharedState) -> Result<(), AppError> {
 }
 
 fn temp_file_path(data_file: &FilePath) -> PathBuf {
-    let file_name = data_file
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let file_name = data_file.file_name().unwrap_or_default().to_string_lossy();
     data_file.with_file_name(format!("{file_name}.tmp"))
 }
 
-async fn save_data(
-    data_file: &FilePath,
-    data: &[TemperatureEntry],
-) -> Result<(), AppError> {
+async fn save_data(data_file: &FilePath, data: &[TemperatureEntry]) -> Result<(), AppError> {
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| AppError::Internal(format!("Fehler beim Serialisieren: {e}")))?;
-    if let Some(parent) = data_file.parent().filter(|path| !path.as_os_str().is_empty()) {
+    if let Some(parent) = data_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
         tokio::fs::create_dir_all(parent).await.map_err(|error| {
             AppError::Internal(format!(
                 "Datenverzeichnis {} konnte nicht erstellt werden: {error}",
@@ -195,14 +192,12 @@ async fn save_data(
             temp_file.display()
         ))
     })?;
-    file.sync_all()
-        .await
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "Fehler beim Synchronisieren von {}: {error}",
-                temp_file.display()
-            ))
-        })?;
+    file.sync_all().await.map_err(|error| {
+        AppError::Internal(format!(
+            "Fehler beim Synchronisieren von {}: {error}",
+            temp_file.display()
+        ))
+    })?;
     drop(file);
     tokio::fs::rename(&temp_file, data_file)
         .await
@@ -297,9 +292,7 @@ fn normalize_metadata(value: Option<String>, field: &str) -> Result<Option<Strin
     Ok(Some(value.to_string()))
 }
 
-async fn get_latest(
-    State(state): State<SharedState>,
-) -> Result<Json<TemperatureEntry>, AppError> {
+async fn get_latest(State(state): State<SharedState>) -> Result<Json<TemperatureEntry>, AppError> {
     let data = state.entries.read().await;
     let latest = data.iter().max_by_key(|e| e.timestamp).cloned();
     match latest {
@@ -351,7 +344,11 @@ async fn create_temperature(
     drop(data);
 
     if let Err(error) = save_data(&state.data_file, &snapshot).await {
-        state.entries.write().await.retain(|item| item.id != entry.id);
+        state
+            .entries
+            .write()
+            .await
+            .retain(|item| item.id != entry.id);
         return Err(error);
     }
 
@@ -410,7 +407,10 @@ async fn get_stats(State(state): State<SharedState>) -> Json<Stats> {
     let count = data.len();
     let sum: f64 = data.iter().map(|e| e.temperature).sum();
     let avg = sum / count as f64;
-    let min = data.iter().map(|e| e.temperature).fold(f64::INFINITY, f64::min);
+    let min = data
+        .iter()
+        .map(|e| e.temperature)
+        .fold(f64::INFINITY, f64::min);
     let max = data
         .iter()
         .map(|e| e.temperature)
@@ -454,7 +454,10 @@ impl IntoResponse for AppError {
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             AppError::Internal(m) => {
                 error!("{m}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Interner Serverfehler".into())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Interner Serverfehler".into(),
+                )
             }
         };
         let body = Json(serde_json::json!({ "error": msg }));
@@ -504,7 +507,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut app = Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
-        .route("/api/temperatures", get(list_temperatures).post(create_temperature).delete(delete_all))
+        .route(
+            "/api/temperatures",
+            get(list_temperatures)
+                .post(create_temperature)
+                .delete(delete_all),
+        )
         .route("/api/temperatures/latest", get(get_latest))
         .route("/api/temperatures/:id", get(get_by_id).delete(delete_by_id))
         .route("/api/temperatures/clear", post(delete_all))
@@ -553,11 +561,8 @@ mod tests {
 
     #[test]
     fn metadata_length_is_bounded() {
-        let error = normalize_metadata(
-            Some("x".repeat(MAX_METADATA_LENGTH + 1)),
-            "sensor_id",
-        )
-        .unwrap_err();
+        let error =
+            normalize_metadata(Some("x".repeat(MAX_METADATA_LENGTH + 1)), "sensor_id").unwrap_err();
         assert!(matches!(error, AppError::BadRequest(_)));
     }
 
