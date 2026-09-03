@@ -6,9 +6,11 @@ Webserver mit Webseite und REST-API zum Speichern von Temperaturdaten. Backend i
 
 - **Webseite** auf `http://localhost:3000` – Dashboard mit Live-Chart, Statistiken, Formular, Tabelle
 - **REST-API** zum Ablegen/Abfragen von Temperaturen
-- **Persistenz** in `data.json` (wird beim Start geladen, bei jedem Write gespeichert)
-- **Validierung** (`-100..100 °C`, finite Zahlen)
-- **Filter** nach `sensor_id`, `location`, Zeitraum, Paginierung
+- **Atomare Persistenz** in `data.json` (Pfad konfigurierbar)
+- **Validierung** (`-100..100 °C`, begrenzte Metadaten und Request-Größe)
+- **Filter** nach `sensor_id`, `location`, Zeitraum, begrenzte Paginierung
+- **Sichere Voreinstellung** ohne Cross-Origin-Zugriff oder Demo-Daten
+- **Automatisierte Checks** für Formatierung, Clippy und Tests
 
 ## Schnellstart
 
@@ -18,9 +20,23 @@ cargo run
 RUST_LOG=debug cargo run
 # optional auf einer anderen Adresse:
 BIND_ADDR=127.0.0.1:3001 cargo run
+# optional mit anderem Speicherort:
+DATA_FILE=/var/lib/temperatur-server/data.json cargo run
 ```
 
 Server läuft auf `http://0.0.0.0:3000` → Webseite unter `http://localhost:3000`
+
+### Konfiguration
+
+| Variable | Standard | Beschreibung |
+|----------|----------|--------------|
+| `BIND_ADDR` | `0.0.0.0:3000` | Socket-Adresse des Servers |
+| `DATA_FILE` | `data.json` | Pfad zur JSON-Datei; fehlende Verzeichnisse werden angelegt |
+| `SEED_DEMO` | `false` | Erzeugt beim ersten Start mit leerem Datenspeicher einen Demo-Wert |
+| `CORS_ORIGIN` | nicht gesetzt | Erlaubt genau diesen zusätzlichen Browser-Origin, z. B. `https://dashboard.example` |
+| `RUST_LOG` | `temperatur_server=debug,tower_http=debug` | Log-Filter |
+
+Eine vorhandene, aber ungültige Datendatei beendet den Start mit einer Fehlermeldung. Dadurch wird eine beschädigte Datei nicht unbemerkt mit neuen Daten überschrieben.
 
 ## API
 
@@ -28,11 +44,13 @@ Server läuft auf `http://0.0.0.0:3000` → Webseite unter `http://localhost:300
 |---------|------|--------------|
 | `GET` | `/` | Webseite |
 | `GET` | `/api/health` | Status + Anzahl |
-| `GET` | `/api/temperatures?limit=50&offset=0&sensor_id=x&location=y&from=2024-01-01T00:00:00Z&to=2024-12-31T23:59:59Z` | Liste (neueste zuerst) |
+| `GET` | `/api/temperatures?limit=50&offset=0&sensor_id=x&location=y&from=2024-01-01T00:00:00Z&to=2024-12-31T23:59:59Z` | Liste (neueste zuerst, maximal 1000 pro Request) |
 | `GET` | `/api/temperatures/latest` | Neueste Messung |
 | `GET` | `/api/temperatures/:id` | Einzelne Messung |
 | `POST` | `/api/temperatures` | Neue Messung |
-| `POST` | `/api/temperatures/:id/delete` | Löschen |
+| `DELETE` | `/api/temperatures/:id` | Löschen |
+| `POST` | `/api/temperatures/:id/delete` | Löschen (Browser-Kompatibilitätsroute) |
+| `DELETE` | `/api/temperatures` | Alle löschen |
 | `POST` | `/api/temperatures/clear` | Alle löschen |
 | `GET` | `/api/stats` | `count`, `avg`, `min`, `max`, `latest` |
 
@@ -41,11 +59,13 @@ Server läuft auf `http://0.0.0.0:3000` → Webseite unter `http://localhost:300
 ```json
 {
   "temperature": 21.5,
-  "sensor_id": "sensor-1",      // optional
-  "location": "Wohnzimmer",     // optional
-  "timestamp": "2024-01-01T12:00:00Z" // optional, default: now()
+  "sensor_id": "sensor-1",
+  "location": "Wohnzimmer",
+  "timestamp": "2024-01-01T12:00:00Z"
 }
 ```
+
+`sensor_id`, `location` und `timestamp` sind optional. Ohne `timestamp` verwendet der Server die aktuelle UTC-Zeit. `sensor_id` und `location` sind auf jeweils 200 Zeichen begrenzt.
 
 ### Beispiele
 
@@ -93,4 +113,12 @@ curl -X POST http://localhost:3000/api/temperatures/<id>/delete
 ```bash
 cargo build --release
 ./target/release/temperatur-server
+```
+
+## Qualität prüfen
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
 ```

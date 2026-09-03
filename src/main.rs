@@ -1,17 +1,32 @@
 use axum::{
+    extract::DefaultBodyLimit,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode},
     response::{Html, IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{
+    error::Error,
+    fmt::{self, Display, Formatter},
+    net::SocketAddr,
+    path::{Path as FilePath, PathBuf},
+    sync::Arc,
+};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
+
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:3000";
+const DEFAULT_DATA_FILE: &str = "data.json";
+const DEFAULT_PAGE_LIMIT: usize = 100;
+const MAX_PAGE_LIMIT: usize = 1_000;
+const MAX_METADATA_LENGTH: usize = 200;
+const MAX_REQUEST_BODY_SIZE: usize = 16 * 1024;
 
 // --- Datenmodelle ---
 
@@ -65,51 +80,156 @@ struct Health {
 struct AppState {
     entries: RwLock<Vec<TemperatureEntry>>,
     persistence: Mutex<()>,
+    data_file: PathBuf,
 }
 
 type SharedState = Arc<AppState>;
 
-const DATA_FILE: &str = "data.json";
-const DATA_TEMP_FILE: &str = "data.json.tmp";
+struct Config {
+    bind_addr: SocketAddr,
+    data_file: PathBuf,
+    seed_demo: bool,
+    cors_origin: Option<HeaderValue>,
+}
+
+impl Config {
+    fn from_env() -> Result<Self, String> {
+        let bind_addr = std::env::var("BIND_ADDR")
+            .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
+            .parse()
+            .map_err(|error| format!("Ungültige BIND_ADDR: {error}"))?;
+        let data_file = std::env::var_os("DATA_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_FILE));
+        let data_file = validate_data_file(data_file)?;
+        let seed_demo = std::env::var("SEED_DEMO")
+            .map(|value| {
+                value
+                    .parse::<bool>()
+                    .map_err(|_| "SEED_DEMO muss 'true' oder 'false' sein".to_string())
+            })
+            .unwrap_or(Ok(false))?;
+        let cors_origin = match std::env::var("CORS_ORIGIN") {
+            Ok(value) => Some(
+                value
+                    .parse::<HeaderValue>()
+                    .map_err(|error| format!("Ungültige CORS_ORIGIN: {error}"))?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(format!("Ungültige CORS_ORIGIN: {error}")),
+        };
+
+        Ok(Self {
+            bind_addr,
+            data_file,
+            seed_demo,
+            cors_origin,
+        })
+    }
+}
 
 // --- Persistence ---
 
-async fn load_data(state: &SharedState) -> bool {
-    match tokio::fs::read_to_string(DATA_FILE).await {
+fn validate_data_file(data_file: PathBuf) -> Result<PathBuf, String> {
+    let has_trailing_separator = data_file
+        .as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|byte| *byte == b'/' || (cfg!(windows) && *byte == b'\\'));
+
+    if data_file.as_os_str().is_empty()
+        || data_file.file_name().is_none()
+        || has_trailing_separator
+        || data_file.is_dir()
+    {
+        return Err(
+            "DATA_FILE muss auf eine Datei und nicht auf ein Verzeichnis zeigen".to_string(),
+        );
+    }
+
+    Ok(data_file)
+}
+
+async fn load_data(state: &SharedState) -> Result<(), AppError> {
+    match tokio::fs::read_to_string(&state.data_file).await {
         Ok(content) => match serde_json::from_str::<Vec<TemperatureEntry>>(&content) {
             Ok(data) => {
                 let count = data.len();
                 *state.entries.write().await = data;
-                info!("{} Einträge aus {DATA_FILE} geladen", count);
-                true
+                info!(
+                    "{} Einträge aus {} geladen",
+                    count,
+                    state.data_file.display()
+                );
+                Ok(())
             }
-            Err(e) => {
-                eprintln!("Fehler beim Parsen von {DATA_FILE}: {e}");
-                false
-            }
+            Err(error) => Err(AppError::Internal(format!(
+                "Fehler beim Parsen von {}: {error}",
+                state.data_file.display()
+            ))),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            info!("Keine bestehende {DATA_FILE} gefunden, starte leer");
-            true
+            info!(
+                "Keine bestehende {} gefunden, starte leer",
+                state.data_file.display()
+            );
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("Fehler beim Laden von {DATA_FILE}: {e}");
-            false
-        }
+        Err(error) => Err(AppError::Internal(format!(
+            "Fehler beim Laden von {}: {error}",
+            state.data_file.display()
+        ))),
     }
 }
 
-async fn save_data(data: &[TemperatureEntry]) -> Result<(), AppError> {
+fn temp_file_path(data_file: &FilePath) -> PathBuf {
+    let file_name = data_file.file_name().unwrap_or_default().to_string_lossy();
+    data_file.with_file_name(format!("{file_name}.tmp"))
+}
+
+async fn save_data(data_file: &FilePath, data: &[TemperatureEntry]) -> Result<(), AppError> {
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| AppError::Internal(format!("Fehler beim Serialisieren: {e}")))?;
-    tokio::fs::write(DATA_TEMP_FILE, json)
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Fehler beim Speichern nach {DATA_TEMP_FILE}: {e}"))
+    if let Some(parent) = data_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            AppError::Internal(format!(
+                "Datenverzeichnis {} konnte nicht erstellt werden: {error}",
+                parent.display()
+            ))
         })?;
-    tokio::fs::rename(DATA_TEMP_FILE, DATA_FILE)
+    }
+
+    let temp_file = temp_file_path(data_file);
+    let mut file = tokio::fs::File::create(&temp_file).await.map_err(|error| {
+        AppError::Internal(format!(
+            "Fehler beim Öffnen von {}: {error}",
+            temp_file.display()
+        ))
+    })?;
+    file.write_all(json.as_bytes()).await.map_err(|error| {
+        AppError::Internal(format!(
+            "Fehler beim Speichern nach {}: {error}",
+            temp_file.display()
+        ))
+    })?;
+    file.sync_all().await.map_err(|error| {
+        AppError::Internal(format!(
+            "Fehler beim Synchronisieren von {}: {error}",
+            temp_file.display()
+        ))
+    })?;
+    drop(file);
+    tokio::fs::rename(&temp_file, data_file)
         .await
-        .map_err(|e| AppError::Internal(format!("Fehler beim Ersetzen von {DATA_FILE}: {e}")))
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "Fehler beim Ersetzen von {}: {error}",
+                data_file.display()
+            ))
+        })
 }
 
 // --- API Handler ---
@@ -126,7 +246,8 @@ async fn health_handler(State(state): State<SharedState>) -> Json<Health> {
 async fn list_temperatures(
     State(state): State<SharedState>,
     Query(params): Query<ListParams>,
-) -> Json<Vec<TemperatureEntry>> {
+) -> Result<Json<Vec<TemperatureEntry>>, AppError> {
+    let (offset, limit) = validate_list_params(&params)?;
     let data = state.entries.read().await;
     let mut filtered: Vec<TemperatureEntry> = data
         .iter()
@@ -141,13 +262,13 @@ async fn list_temperatures(
                     return false;
                 }
             }
-            if let Some(from) = params.from {
-                if e.timestamp < from {
+            if let Some(ref from) = params.from {
+                if e.timestamp < *from {
                     return false;
                 }
             }
-            if let Some(to) = params.to {
-                if e.timestamp > to {
+            if let Some(ref to) = params.to {
+                if e.timestamp > *to {
                     return false;
                 }
             }
@@ -157,18 +278,44 @@ async fn list_temperatures(
         .collect();
 
     // Neueste zuerst sortieren (timestamp absteigend)
-    filtered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    let offset = params.offset.unwrap_or(0);
-    let limit = params.limit.unwrap_or(100);
+    filtered.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
 
     let result: Vec<TemperatureEntry> = filtered.into_iter().skip(offset).take(limit).collect();
-    Json(result)
+    Ok(Json(result))
 }
 
-async fn get_latest(
-    State(state): State<SharedState>,
-) -> Result<Json<TemperatureEntry>, AppError> {
+fn validate_list_params(params: &ListParams) -> Result<(usize, usize), AppError> {
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if limit > MAX_PAGE_LIMIT {
+        return Err(AppError::BadRequest(format!(
+            "limit darf höchstens {MAX_PAGE_LIMIT} sein"
+        )));
+    }
+    if matches!((&params.from, &params.to), (Some(from), Some(to)) if from > to) {
+        return Err(AppError::BadRequest(
+            "from darf nicht nach to liegen".to_string(),
+        ));
+    }
+    Ok((params.offset.unwrap_or(0), limit))
+}
+
+fn normalize_metadata(value: Option<String>, field: &str) -> Result<Option<String>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > MAX_METADATA_LENGTH {
+        return Err(AppError::BadRequest(format!(
+            "{field} darf höchstens {MAX_METADATA_LENGTH} Zeichen lang sein"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
+async fn get_latest(State(state): State<SharedState>) -> Result<Json<TemperatureEntry>, AppError> {
     let data = state.entries.read().await;
     let latest = data.iter().max_by_key(|e| e.timestamp).cloned();
     match latest {
@@ -209,8 +356,8 @@ async fn create_temperature(
         id: Uuid::new_v4().to_string(),
         temperature: payload.temperature,
         timestamp: payload.timestamp.unwrap_or_else(Utc::now),
-        sensor_id: payload.sensor_id.filter(|s| !s.trim().is_empty()),
-        location: payload.location.filter(|s| !s.trim().is_empty()),
+        sensor_id: normalize_metadata(payload.sensor_id, "sensor_id")?,
+        location: normalize_metadata(payload.location, "location")?,
     };
 
     let _persistence = state.persistence.lock().await;
@@ -219,8 +366,12 @@ async fn create_temperature(
     let snapshot = data.clone();
     drop(data);
 
-    if let Err(error) = save_data(&snapshot).await {
-        state.entries.write().await.retain(|item| item.id != entry.id);
+    if let Err(error) = save_data(&state.data_file, &snapshot).await {
+        state
+            .entries
+            .write()
+            .await
+            .retain(|item| item.id != entry.id);
         return Err(error);
     }
 
@@ -241,7 +392,7 @@ async fn delete_by_id(
     let snapshot = data.clone();
     drop(data);
 
-    if let Err(error) = save_data(&snapshot).await {
+    if let Err(error) = save_data(&state.data_file, &snapshot).await {
         state.entries.write().await.insert(index, removed);
         return Err(error);
     }
@@ -258,7 +409,7 @@ async fn delete_all(State(state): State<SharedState>) -> Result<StatusCode, AppE
     let previous = std::mem::take(&mut *data);
     drop(data);
 
-    if let Err(error) = save_data(&[]).await {
+    if let Err(error) = save_data(&state.data_file, &[]).await {
         *state.entries.write().await = previous;
         return Err(error);
     }
@@ -279,7 +430,10 @@ async fn get_stats(State(state): State<SharedState>) -> Json<Stats> {
     let count = data.len();
     let sum: f64 = data.iter().map(|e| e.temperature).sum();
     let avg = sum / count as f64;
-    let min = data.iter().map(|e| e.temperature).fold(f64::INFINITY, f64::min);
+    let min = data
+        .iter()
+        .map(|e| e.temperature)
+        .fold(f64::INFINITY, f64::min);
     let max = data
         .iter()
         .map(|e| e.temperature)
@@ -304,14 +458,29 @@ enum AppError {
     Internal(String),
 }
 
+impl Display for AppError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadRequest(message) | Self::NotFound(message) | Self::Internal(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl Error for AppError {}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match self {
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             AppError::Internal(m) => {
-                eprintln!("{m}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Interner Serverfehler".into())
+                error!("{m}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Interner Serverfehler".into(),
+                )
             }
         };
         let body = Json(serde_json::json!({ "error": msg }));
@@ -328,7 +497,7 @@ async fn index_handler() -> Html<&'static str> {
 // --- Main ---
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -336,14 +505,15 @@ async fn main() {
         )
         .init();
 
+    let config = Config::from_env().map_err(std::io::Error::other)?;
     let state: SharedState = Arc::new(AppState {
         entries: RwLock::new(Vec::new()),
         persistence: Mutex::new(()),
+        data_file: config.data_file.clone(),
     });
-    let can_seed_data = load_data(&state).await;
+    load_data(&state).await?;
 
-    // Beispiel-Daten wenn leer (optional, zum Testen)
-    if can_seed_data && state.entries.read().await.is_empty() {
+    if config.seed_demo && state.entries.read().await.is_empty() {
         let mut data = state.entries.write().await;
         data.push(TemperatureEntry {
             id: Uuid::new_v4().to_string(),
@@ -354,32 +524,144 @@ async fn main() {
         });
         let snapshot = data.clone();
         drop(data);
-        if let Err(error) = save_data(&snapshot).await {
-            eprintln!("Initiale Beispieldaten konnten nicht gespeichert werden: {error:?}");
-        }
+        save_data(&state.data_file, &snapshot).await?;
     }
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(index_handler))
         .route("/api/health", get(health_handler))
-        .route("/api/temperatures", get(list_temperatures).post(create_temperature).delete(delete_all))
+        .route(
+            "/api/temperatures",
+            get(list_temperatures)
+                .post(create_temperature)
+                .delete(delete_all),
+        )
         .route("/api/temperatures/latest", get(get_latest))
         .route("/api/temperatures/:id", get(get_by_id).delete(delete_by_id))
         .route("/api/temperatures/clear", post(delete_all))
         .route("/api/temperatures/:id/delete", post(delete_by_id))
         .route("/api/stats", get(get_stats))
         .with_state(state)
-        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_SIZE))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    info!("🚀 Server läuft auf http://{}", addr);
-    info!("   Webseite: http://localhost:3000");
-    info!("   API:      http://localhost:3000/api/temperatures");
-    println!("Server läuft auf http://{addr}");
+    if let Some(origin) = config.cors_origin {
+        app = app.layer(
+            CorsLayer::new()
+                .allow_origin(origin)
+                .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                .allow_headers([CONTENT_TYPE]),
+        );
+    }
 
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+    let port = config.bind_addr.port();
+    info!("🚀 Server läuft auf http://{}", config.bind_addr);
+    info!("   Webseite: http://localhost:{port}");
+    info!("   API:      http://localhost:{port}/api/temperatures");
+    println!("Server läuft auf http://{}", config.bind_addr);
+
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 // - dieses kommentar ist das einzige element, welches durch menschlichen einfluss entstanden ist
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_file_must_refer_to_a_file() {
+        let root = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+        let trailing_separator =
+            PathBuf::from(format!("temperatures{}", std::path::MAIN_SEPARATOR));
+
+        assert!(validate_data_file(PathBuf::new()).is_err());
+        assert!(validate_data_file(root).is_err());
+        assert!(validate_data_file(trailing_separator).is_err());
+        assert!(validate_data_file(std::env::temp_dir()).is_err());
+
+        assert_eq!(
+            validate_data_file(PathBuf::from("data.json")).unwrap(),
+            PathBuf::from("data.json")
+        );
+    }
+
+    #[test]
+    fn metadata_is_trimmed_and_empty_values_are_omitted() {
+        assert_eq!(
+            normalize_metadata(Some("  sensor-1  ".to_string()), "sensor_id").unwrap(),
+            Some("sensor-1".to_string())
+        );
+        assert_eq!(
+            normalize_metadata(Some("  ".to_string()), "location").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn metadata_length_is_bounded() {
+        let error =
+            normalize_metadata(Some("x".repeat(MAX_METADATA_LENGTH + 1)), "sensor_id").unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn list_parameters_are_validated() {
+        let params = ListParams {
+            limit: Some(MAX_PAGE_LIMIT + 1),
+            offset: None,
+            sensor_id: None,
+            location: None,
+            from: None,
+            to: None,
+        };
+        assert!(matches!(
+            validate_list_params(&params),
+            Err(AppError::BadRequest(_))
+        ));
+
+        let params = ListParams {
+            limit: None,
+            offset: Some(10),
+            sensor_id: None,
+            location: None,
+            from: Some("2026-01-02T00:00:00Z".parse().unwrap()),
+            to: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+        };
+        assert!(matches!(
+            validate_list_params(&params),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistence_round_trip_uses_configured_path() {
+        let directory = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let data_file = directory.join("nested/temperatures.json");
+        let entry = TemperatureEntry {
+            id: Uuid::new_v4().to_string(),
+            temperature: 21.5,
+            timestamp: Utc::now(),
+            sensor_id: Some("sensor-1".to_string()),
+            location: Some("Labor".to_string()),
+        };
+
+        save_data(&data_file, std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            entries: RwLock::new(Vec::new()),
+            persistence: Mutex::new(()),
+            data_file,
+        });
+        load_data(&state).await.unwrap();
+
+        let loaded = state.entries.read().await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, entry.id);
+        drop(loaded);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
