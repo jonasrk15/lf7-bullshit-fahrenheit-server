@@ -101,6 +101,7 @@ impl Config {
         let data_file = std::env::var_os("DATA_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_FILE));
+        let data_file = validate_data_file(data_file)?;
         let seed_demo = std::env::var("SEED_DEMO")
             .map(|value| {
                 value
@@ -128,6 +129,26 @@ impl Config {
 }
 
 // --- Persistence ---
+
+fn validate_data_file(data_file: PathBuf) -> Result<PathBuf, String> {
+    let has_trailing_separator = data_file
+        .as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|byte| *byte == b'/' || (cfg!(windows) && *byte == b'\\'));
+
+    if data_file.as_os_str().is_empty()
+        || data_file.file_name().is_none()
+        || has_trailing_separator
+        || data_file.is_dir()
+    {
+        return Err(
+            "DATA_FILE muss auf eine Datei und nicht auf ein Verzeichnis zeigen".to_string(),
+        );
+    }
+
+    Ok(data_file)
+}
 
 async fn load_data(state: &SharedState) -> Result<(), AppError> {
     match tokio::fs::read_to_string(&state.data_file).await {
@@ -549,6 +570,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_file_must_refer_to_a_file() {
+        let root = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+        let trailing_separator =
+            PathBuf::from(format!("temperatures{}", std::path::MAIN_SEPARATOR));
+
+        assert!(validate_data_file(PathBuf::new()).is_err());
+        assert!(validate_data_file(root).is_err());
+        assert!(validate_data_file(trailing_separator).is_err());
+        assert!(validate_data_file(std::env::temp_dir()).is_err());
+
+        assert_eq!(
+            validate_data_file(PathBuf::from("data.json")).unwrap(),
+            PathBuf::from("data.json")
+        );
+    }
 
     #[test]
     fn metadata_is_trimmed_and_empty_values_are_omitted() {
