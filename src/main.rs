@@ -257,7 +257,7 @@ async fn list_temperatures(
         .collect();
 
     // Neueste zuerst sortieren (timestamp absteigend)
-    filtered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    filtered.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
 
     let result: Vec<TemperatureEntry> = filtered.into_iter().skip(offset).take(limit).collect();
     Ok(Json(result))
