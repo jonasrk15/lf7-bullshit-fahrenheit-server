@@ -1,0 +1,24 @@
+[Unit]
+Description=Rust Temperatur-Server
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=temperatur-server
+Image=ghcr.io/jonasrk15/lf7-bullshit-fahrenheit-server:latest
+Pull=newer
+PublishPort=3000:3000
+Volume=/opt/temperatur-server/data:/var/lib/temperatur-server:Z,U
+Environment=BIND_ADDR=0.0.0.0:3000
+Environment=DATA_FILE=/var/lib/temperatur-server/data.json
+Environment=RUST_LOG=temperatur_server=info,tower_http=info
+DropCapability=all
+NoNewPrivileges=true
+ReadOnly=true
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
