@@ -8,7 +8,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use uuid::Uuid;
@@ -62,19 +62,24 @@ struct Health {
 
 // --- Shared State ---
 
-type AppState = Arc<RwLock<Vec<TemperatureEntry>>>;
+struct AppState {
+    entries: RwLock<Vec<TemperatureEntry>>,
+    persistence: Mutex<()>,
+}
+
+type SharedState = Arc<AppState>;
 
 const DATA_FILE: &str = "data.json";
 const DATA_TEMP_FILE: &str = "data.json.tmp";
 
 // --- Persistence ---
 
-async fn load_data(state: &AppState) -> bool {
+async fn load_data(state: &SharedState) -> bool {
     match tokio::fs::read_to_string(DATA_FILE).await {
         Ok(content) => match serde_json::from_str::<Vec<TemperatureEntry>>(&content) {
             Ok(data) => {
                 let count = data.len();
-                *state.write().await = data;
+                *state.entries.write().await = data;
                 info!("{} Einträge aus {DATA_FILE} geladen", count);
                 true
             }
@@ -109,8 +114,8 @@ async fn save_data(data: &[TemperatureEntry]) -> Result<(), AppError> {
 
 // --- API Handler ---
 
-async fn health_handler(State(state): State<AppState>) -> Json<Health> {
-    let count = state.read().await.len();
+async fn health_handler(State(state): State<SharedState>) -> Json<Health> {
+    let count = state.entries.read().await.len();
     Json(Health {
         status: "ok".to_string(),
         count,
@@ -119,10 +124,10 @@ async fn health_handler(State(state): State<AppState>) -> Json<Health> {
 }
 
 async fn list_temperatures(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     Query(params): Query<ListParams>,
 ) -> Json<Vec<TemperatureEntry>> {
-    let data = state.read().await;
+    let data = state.entries.read().await;
     let mut filtered: Vec<TemperatureEntry> = data
         .iter()
         .filter(|e| {
@@ -161,8 +166,10 @@ async fn list_temperatures(
     Json(result)
 }
 
-async fn get_latest(State(state): State<AppState>) -> Result<Json<TemperatureEntry>, AppError> {
-    let data = state.read().await;
+async fn get_latest(
+    State(state): State<SharedState>,
+) -> Result<Json<TemperatureEntry>, AppError> {
+    let data = state.entries.read().await;
     let latest = data.iter().max_by_key(|e| e.timestamp).cloned();
     match latest {
         Some(entry) => Ok(Json(entry)),
@@ -171,10 +178,10 @@ async fn get_latest(State(state): State<AppState>) -> Result<Json<TemperatureEnt
 }
 
 async fn get_by_id(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<TemperatureEntry>, AppError> {
-    let data = state.read().await;
+    let data = state.entries.read().await;
     data.iter()
         .find(|e| e.id == id)
         .cloned()
@@ -183,7 +190,7 @@ async fn get_by_id(
 }
 
 async fn create_temperature(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     Json(payload): Json<CreateTemperature>,
 ) -> Result<(StatusCode, Json<TemperatureEntry>), AppError> {
     // Validierung
@@ -206,10 +213,14 @@ async fn create_temperature(
         location: payload.location.filter(|s| !s.trim().is_empty()),
     };
 
-    let mut data = state.write().await;
+    let _persistence = state.persistence.lock().await;
+    let mut data = state.entries.write().await;
     data.push(entry.clone());
-    if let Err(error) = save_data(&data).await {
-        data.pop();
+    let snapshot = data.clone();
+    drop(data);
+
+    if let Err(error) = save_data(&snapshot).await {
+        state.entries.write().await.retain(|item| item.id != entry.id);
         return Err(error);
     }
 
@@ -217,35 +228,45 @@ async fn create_temperature(
 }
 
 async fn delete_by_id(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let mut data = state.write().await;
-    let previous = data.clone();
-    let len_before = data.len();
-    data.retain(|e| e.id != id);
-    if data.len() == len_before {
-        return Err(AppError::NotFound(format!("ID {id} nicht gefunden")));
-    }
-    if let Err(error) = save_data(&data).await {
-        *data = previous;
+    let _persistence = state.persistence.lock().await;
+    let mut data = state.entries.write().await;
+    let index = data
+        .iter()
+        .position(|entry| entry.id == id)
+        .ok_or_else(|| AppError::NotFound(format!("ID {id} nicht gefunden")))?;
+    let removed = data.remove(index);
+    let snapshot = data.clone();
+    drop(data);
+
+    if let Err(error) = save_data(&snapshot).await {
+        state.entries.write().await.insert(index, removed);
         return Err(error);
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn delete_all(State(state): State<AppState>) -> Result<StatusCode, AppError> {
-    let mut data = state.write().await;
+async fn delete_all(State(state): State<SharedState>) -> Result<StatusCode, AppError> {
+    let _persistence = state.persistence.lock().await;
+    let mut data = state.entries.write().await;
+    if data.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     let previous = std::mem::take(&mut *data);
-    if let Err(error) = save_data(&data).await {
-        *data = previous;
+    drop(data);
+
+    if let Err(error) = save_data(&[]).await {
+        *state.entries.write().await = previous;
         return Err(error);
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_stats(State(state): State<AppState>) -> Json<Stats> {
-    let data = state.read().await;
+async fn get_stats(State(state): State<SharedState>) -> Json<Stats> {
+    let data = state.entries.read().await;
     if data.is_empty() {
         return Json(Stats {
             count: 0,
@@ -315,12 +336,15 @@ async fn main() {
         )
         .init();
 
-    let state: AppState = Arc::new(RwLock::new(Vec::new()));
+    let state: SharedState = Arc::new(AppState {
+        entries: RwLock::new(Vec::new()),
+        persistence: Mutex::new(()),
+    });
     let can_seed_data = load_data(&state).await;
 
     // Beispiel-Daten wenn leer (optional, zum Testen)
-    if can_seed_data && state.read().await.is_empty() {
-        let mut data = state.write().await;
+    if can_seed_data && state.entries.read().await.is_empty() {
+        let mut data = state.entries.write().await;
         data.push(TemperatureEntry {
             id: Uuid::new_v4().to_string(),
             temperature: 21.5,
@@ -328,7 +352,9 @@ async fn main() {
             sensor_id: Some("demo-sensor-1".into()),
             location: Some("Wohnzimmer".into()),
         });
-        if let Err(error) = save_data(&data).await {
+        let snapshot = data.clone();
+        drop(data);
+        if let Err(error) = save_data(&snapshot).await {
             eprintln!("Initiale Beispieldaten konnten nicht gespeichert werden: {error:?}");
         }
     }
@@ -344,8 +370,8 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let addr = "0.0.0.0:3000";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("🚀 Server läuft auf http://{}", addr);
     info!("   Webseite: http://localhost:3000");
     info!("   API:      http://localhost:3000/api/temperatures");

@@ -16,6 +16,8 @@ Webserver mit Webseite und REST-API zum Speichern von Temperaturdaten. Backend i
 cargo run
 # oder mit log-level:
 RUST_LOG=debug cargo run
+# optional auf einer anderen Adresse:
+BIND_ADDR=127.0.0.1:3001 cargo run
 ```
 
 Server läuft auf `http://0.0.0.0:3000` → Webseite unter `http://localhost:3000`
