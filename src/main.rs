@@ -108,13 +108,15 @@ impl Config {
                     .map_err(|_| "SEED_DEMO muss 'true' oder 'false' sein".to_string())
             })
             .unwrap_or(Ok(false))?;
-        let cors_origin = std::env::var("CORS_ORIGIN")
-            .map(|value| {
+        let cors_origin = match std::env::var("CORS_ORIGIN") {
+            Ok(value) => Some(
                 value
                     .parse::<HeaderValue>()
-                    .map_err(|error| format!("Ungültige CORS_ORIGIN: {error}"))
-            })
-            .transpose()?;
+                    .map_err(|error| format!("Ungültige CORS_ORIGIN: {error}"))?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(format!("Ungültige CORS_ORIGIN: {error}")),
+        };
 
         Ok(Self {
             bind_addr,
